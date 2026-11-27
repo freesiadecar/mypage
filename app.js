@@ -1,31 +1,81 @@
-const STORAGE_KEY = "mypage.workspace.v1";
-// shortcut: data stays in this browser; add a backend when cross-device sync is needed.
-let storageAvailable = true;
+const LEGACY_STORAGE_KEY = "mypage.workspace.v1";
+const WORKSPACE_TABLE = "mypage_workspaces";
+const SUPABASE_CONFIG = window.MYPAGE_SUPABASE_CONFIG ?? {};
+const supabaseClient = window.supabase?.createClient && SUPABASE_CONFIG.url && SUPABASE_CONFIG.publishableKey
+  ? window.supabase.createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.publishableKey)
+  : null;
 let toastTimer;
 let gameQuery = "";
 let gameStatusFilter = "all";
+let currentUser = null;
+let cloudReady = false;
+let loadingUserId = null;
+let authRun = 0;
+let saveQueue = Promise.resolve();
 
 function emptyData() {
   return { projects: [], tasks: [], games: [] };
 }
 
-function loadData() {
+function normalizeWorkspace(value) {
+  if (typeof value === "string") value = JSON.parse(value);
+  if (value?.data !== undefined) value = typeof value.data === "string" ? JSON.parse(value.data) : value.data;
+  if (!value || !Array.isArray(value.projects) || !Array.isArray(value.tasks)) throw new Error("数据文件必须包含 projects 和 tasks 数组。");
+  const projects = value.projects.map((project) => ({
+    id: String(project.id || id()),
+    name: String(project.name ?? "").trim(),
+    description: String(project.description ?? ""),
+    due: String(project.due ?? ""),
+    color: escapeColor(project.color),
+    meetings: Array.isArray(project.meetings) ? project.meetings.map((meeting) => ({
+      id: String(meeting.id || id()),
+      title: String(meeting.title ?? ""),
+      date: String(meeting.date ?? ""),
+      notes: String(meeting.notes ?? ""),
+      nextSteps: String(meeting.nextSteps ?? "")
+    })) : []
+  })).filter((project) => project.name);
+  const projectIds = new Set(projects.map((project) => project.id));
+  const tasks = value.tasks.filter((task) => task && String(task.title ?? "").trim()).map((task) => ({
+    id: String(task.id || id()),
+    title: String(task.title).trim(),
+    projectId: projectIds.has(String(task.projectId ?? "")) ? String(task.projectId) : "",
+    due: String(task.due ?? ""),
+    done: Boolean(task.done),
+    priority: ["高", "中", "低"].includes(task.priority) ? task.priority : "中",
+    description: String(task.description ?? "")
+  }));
+  const games = Array.isArray(value.games) ? value.games.filter((game) => game && String(game.title ?? "").trim()).map((game) => ({
+    id: String(game.id || id()),
+    title: String(game.title).trim(),
+    platform: String(game.platform ?? ""),
+    genre: String(game.genre ?? ""),
+    status: ["planned", "playing", "completed", "paused"].includes(game.status) ? game.status : "planned",
+    rating: game.rating != null && game.rating !== "" && Number.isFinite(Number(game.rating)) ? Math.max(1, Math.min(10, Number(game.rating))) : "",
+    notes: String(game.notes ?? "")
+  })) : [];
+  return { projects, tasks, games };
+}
+
+function readLegacyData() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return emptyData();
-    const value = JSON.parse(raw);
-    if (!value || !Array.isArray(value.projects) || !Array.isArray(value.tasks) || !Array.isArray(value.games)) throw new Error("Invalid local data");
-    return value;
+    const raw = localStorage.getItem(LEGACY_STORAGE_KEY);
+    return raw ? normalizeWorkspace(raw) : null;
   } catch {
-    storageAvailable = false;
-    return emptyData();
+    return null;
   }
 }
 
-let data = loadData();
+function hasRecords(value) {
+  return value.projects.length + value.tasks.length + value.games.length > 0;
+}
+
+let data = emptyData();
 const app = document.querySelector("#app");
 const dialog = document.querySelector("#entry-dialog");
 const toast = document.querySelector("#toast");
+const authRoot = document.querySelector("#auth-root");
+const workspaceShell = document.querySelector("#workspace-shell");
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
@@ -42,18 +92,183 @@ function showToast(message) {
   toastTimer = setTimeout(() => toast.classList.remove("visible"), 2600);
 }
 
-function saveData(message = "已保存到本机") {
-  if (!storageAvailable) {
-    showToast("本地数据无法读取，当前操作没有覆盖原数据。");
-    return false;
+function setSaveStatus(label, state = "") {
+  document.querySelector("#save-label").textContent = label;
+  document.querySelector(".save-indicator").classList.toggle("failed", state === "failed");
+  document.querySelector(".save-indicator").classList.toggle("saving", state === "saving");
+}
+
+function saveData(message = "已同步到云端") {
+  if (!cloudReady || !currentUser) {
+    showToast("请先登录，才能保存到云端。");
+    return Promise.resolve(false);
   }
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  const snapshot = JSON.parse(JSON.stringify(data));
+  const userId = currentUser.id;
+  const queuedSave = saveQueue.then(async () => {
+    setSaveStatus("正在同步…", "saving");
+    const { error } = await supabaseClient.from(WORKSPACE_TABLE).upsert({
+      user_id: userId,
+      data: snapshot,
+      updated_at: new Date().toISOString()
+    }, { onConflict: "user_id" });
+    if (error) throw error;
+    setSaveStatus("云端已同步");
     showToast(message);
     return true;
-  } catch {
-    showToast("保存失败，浏览器可能没有可用的本地存储空间。");
+  });
+  saveQueue = queuedSave.catch(() => false);
+  return queuedSave.catch((error) => {
+    setSaveStatus("同步失败", "failed");
+    showToast(`云端保存失败：${error.message ?? "请检查网络后重试。"}`);
     return false;
+  });
+}
+
+function renderAuth(mode = "sign-in", message = "", isError = false) {
+  authRoot.hidden = false;
+  workspaceShell.hidden = true;
+  if (!supabaseClient) {
+    authRoot.innerHTML = `<section class="auth-card"><a class="brand auth-brand" href="#/home"><span class="brand-mark" aria-hidden="true">M</span><span class="brand-copy"><strong>我的工作台</strong><small>PERSONAL WORKSPACE</small></span></a><h1>云端空间还未连接</h1><p class="auth-description">登录和数据同步需要 Supabase 项目。连接后，项目、任务和游戏资料会保存在云端，换设备登录也能继续使用。</p><div class="auth-setup">下一步需要在 <code>supabase-config.js</code> 配置项目 URL 和公开 Publishable Key，并在 Supabase 执行 <code>supabase/schema.sql</code>。不要在网页中放服务端密钥。</div></section>`;
+    return;
+  }
+  if (mode === "loading") {
+    authRoot.innerHTML = `<section class="auth-card"><div class="auth-brand"><span class="brand-mark" aria-hidden="true">M</span><span class="brand-copy"><strong>我的工作台</strong><small>PERSONAL WORKSPACE</small></span></div><h1>正在连接云端</h1><p class="auth-description">${escapeHtml(message || "正在读取你的数据…")}</p></section>`;
+    return;
+  }
+  const creating = mode === "sign-up";
+  const authMode = creating ? "sign-up" : "sign-in";
+  authRoot.innerHTML = `<section class="auth-card"><div class="auth-brand"><span class="brand-mark" aria-hidden="true">M</span><span class="brand-copy"><strong>我的工作台</strong><small>PERSONAL WORKSPACE</small></span></div><h1>${creating ? "创建你的账号" : "登录工作台"}</h1><p class="auth-description">使用同一个邮箱账号，在不同设备访问同一份云端数据。</p><form class="auth-form" id="auth-form" data-mode="${authMode}"><label for="auth-email">邮箱<input id="auth-email" name="email" type="email" autocomplete="email" required></label><label for="auth-password">密码<input id="auth-password" name="password" type="password" autocomplete="${creating ? "new-password" : "current-password"}" minlength="8" required></label><button class="button primary" type="submit">${creating ? "创建账号" : "登录"}</button></form><p class="auth-message${isError ? " error" : ""}" id="auth-message">${escapeHtml(message)}</p><button class="auth-switch" type="button" data-action="auth-switch" data-mode="${creating ? "sign-in" : "sign-up"}">${creating ? "已有账号？返回登录" : "还没有账号？创建一个"}</button></section>`;
+}
+
+async function handleAuthSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const values = new FormData(form);
+  const email = String(values.get("email") ?? "").trim();
+  const password = String(values.get("password") ?? "");
+  const submit = form.querySelector('[type="submit"]');
+  const message = document.querySelector("#auth-message");
+  submit.disabled = true;
+  message.classList.remove("error");
+  message.textContent = "正在连接…";
+  try {
+    const result = form.dataset.mode === "sign-up"
+      ? await supabaseClient.auth.signUp({ email, password, options: { emailRedirectTo: `${location.origin}${location.pathname}` } })
+      : await supabaseClient.auth.signInWithPassword({ email, password });
+    submit.disabled = false;
+    if (result.error) {
+      message.classList.add("error");
+      message.textContent = result.error.message;
+    } else if (form.dataset.mode === "sign-up" && !result.data.session) {
+      renderAuth("sign-in", "注册邮件已发送，请先完成邮箱验证，再回来登录。");
+    } else {
+      renderAuth("loading", "正在载入你的云端空间…");
+    }
+  } catch (error) {
+    submit.disabled = false;
+    message.classList.add("error");
+    message.textContent = error.message || "连接失败，请稍后重试。";
+  }
+}
+
+async function handleSession(session) {
+  const user = session?.user;
+  if (!user) {
+    ++authRun;
+    currentUser = null;
+    cloudReady = false;
+    loadingUserId = null;
+    data = emptyData();
+    workspaceShell.hidden = true;
+    renderAuth("sign-in");
+    return;
+  }
+  if (currentUser?.id === user.id && cloudReady) return;
+  if (loadingUserId === user.id) return;
+  const run = ++authRun;
+  loadingUserId = user.id;
+  currentUser = user;
+  cloudReady = false;
+  renderAuth("loading", "正在读取你的云端数据…");
+  const { data: row, error } = await supabaseClient.from(WORKSPACE_TABLE).select("data").eq("user_id", user.id).maybeSingle();
+  if (run !== authRun) {
+    if (loadingUserId === user.id) loadingUserId = null;
+    return;
+  }
+  if (error) {
+    currentUser = null;
+    loadingUserId = null;
+    renderAuth("sign-in", `读取云端空间失败：${error.message}。请确认数据库表和权限策略已配置。`, true);
+    return;
+  }
+  let migrateLegacy = false;
+  if (row) {
+    try {
+      data = normalizeWorkspace(row.data);
+    } catch {
+      loadingUserId = null;
+      currentUser = null;
+      renderAuth("sign-in", "云端数据格式无法读取，没有覆盖现有数据。", true);
+      return;
+    }
+  } else {
+    const legacy = readLegacyData();
+    migrateLegacy = !!legacy && hasRecords(legacy) && confirm("检测到这个浏览器里有旧版本地数据。要把它上传到当前账号的云端空间吗？");
+    data = migrateLegacy ? legacy : emptyData();
+  }
+  cloudReady = true;
+  loadingUserId = null;
+  document.querySelector("#profile-email").textContent = user.email || "我的云端空间";
+  authRoot.hidden = true;
+  workspaceShell.hidden = false;
+  setSaveStatus("云端已同步");
+  render();
+  if (!row) await saveData(migrateLegacy ? "旧数据已迁移到云端" : "云端空间已创建");
+}
+
+async function startApp() {
+  if (!supabaseClient) {
+    renderAuth();
+    return;
+  }
+  supabaseClient.auth.onAuthStateChange((_event, session) => {
+    setTimeout(() => void handleSession(session), 0);
+  });
+  const { data: sessionData, error } = await supabaseClient.auth.getSession();
+  if (error) renderAuth("sign-in", error.message, true);
+  else await handleSession(sessionData.session);
+}
+
+function exportWorkspace() {
+  const file = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(file);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `mypage-backup-${localDateString()}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showToast("已导出云端数据备份。");
+}
+
+async function importWorkspaceFile(file) {
+  if (!file) return;
+  if (file.size > 5 * 1024 * 1024) {
+    showToast("文件超过 5 MB，无法导入。");
+    return;
+  }
+  try {
+    const parsed = JSON.parse(await file.text());
+    const source = parsed?.data !== undefined ? (typeof parsed.data === "string" ? JSON.parse(parsed.data) : parsed.data) : parsed;
+    const imported = normalizeWorkspace(source);
+    if (!confirm("导入会替换当前账号的项目和任务；若文件含 games 字段，也会替换游戏资料。继续吗？")) return;
+    if (!Array.isArray(source.games)) imported.games = data.games;
+    const previous = data;
+    data = imported;
+    if (!await saveData("数据已导入并同步到云端")) data = previous;
+    render();
+  } catch (error) {
+    showToast(`导入失败：${error.message ?? "请检查 JSON 文件格式。"}`);
   }
 }
 
@@ -88,7 +303,6 @@ function updateShell(page) {
   document.querySelectorAll("[data-nav]").forEach((link) => link.classList.toggle("active", link.dataset.nav === active));
   document.querySelector("#breadcrumb-title").textContent = labels[page] ?? "总览";
   document.querySelector("#nav-task-count").textContent = data.tasks.filter((task) => !task.done).length;
-  document.querySelector("#save-label").textContent = storageAvailable ? "本机保存" : "存储不可用";
   document.title = `${labels[page] ?? "总览"} · 我的工作台`;
 }
 
@@ -217,7 +431,7 @@ function renderGames() {
   const playing = data.games.filter((game) => game.status === "playing").length;
   const completed = data.games.filter((game) => game.status === "completed").length;
   return `${heading("GAME LIBRARY", "游戏资料库", "收集游戏信息、游玩状态和自己的笔记。", `<button class="button primary" type="button" data-action="create-game"><span class="icon-plus" aria-hidden="true">＋</span>添加游戏</button>`)}
-    <section class="stat-grid game-stats"><article class="stat-card"><div class="stat-top"><span>全部游戏</span><span class="stat-icon" aria-hidden="true">▤</span></div><div class="stat-value">${data.games.length}<small>款游戏</small></div><div class="stat-foot">你的个人资料库</div></article><article class="stat-card"><div class="stat-top"><span>正在游玩</span><span class="stat-icon" aria-hidden="true">◉</span></div><div class="stat-value">${playing}<small>款游戏</small></div><div class="stat-foot">继续当前旅程</div></article><article class="stat-card"><div class="stat-top"><span>已经通关</span><span class="stat-icon" aria-hidden="true">✓</span></div><div class="stat-value">${completed}<small>款游戏</small></div><div class="stat-foot">值得回味的冒险</div></article><article class="stat-card attention"><div class="stat-top"><span>本机保存</span><span class="stat-icon" aria-hidden="true">⌂</span></div><div class="stat-value">${storageAvailable ? "是" : "否"}<small>仅当前浏览器</small></div><div class="stat-foot">不会上传到服务器</div></article></section>
+    <section class="stat-grid game-stats"><article class="stat-card"><div class="stat-top"><span>全部游戏</span><span class="stat-icon" aria-hidden="true">▤</span></div><div class="stat-value">${data.games.length}<small>款游戏</small></div><div class="stat-foot">你的个人资料库</div></article><article class="stat-card"><div class="stat-top"><span>正在游玩</span><span class="stat-icon" aria-hidden="true">◉</span></div><div class="stat-value">${playing}<small>款游戏</small></div><div class="stat-foot">继续当前旅程</div></article><article class="stat-card"><div class="stat-top"><span>已经通关</span><span class="stat-icon" aria-hidden="true">✓</span></div><div class="stat-value">${completed}<small>款游戏</small></div><div class="stat-foot">值得回味的冒险</div></article><article class="stat-card attention"><div class="stat-top"><span>数据存储</span><span class="stat-icon" aria-hidden="true">☁</span></div><div class="stat-value">云端<small>已连接</small></div><div class="stat-foot">同一账号可在其他设备登录</div></article></section>
     <section><div class="section-heading"><div><h2>我的游戏</h2><p>按名称、平台或笔记搜索。</p></div><span class="game-count" id="game-count"></span></div>
     <div class="filter-bar"><label class="search-wrap"><span class="sr-only">搜索游戏</span><input class="search-input" id="game-search" type="search" placeholder="搜索游戏、平台、类型或笔记" value="${escapeHtml(gameQuery)}"></label><label><span class="sr-only">按游玩状态筛选</span><select class="filter-select" id="game-status-filter"><option value="all" ${gameStatusFilter === "all" ? "selected" : ""}>所有状态</option><option value="planned" ${gameStatusFilter === "planned" ? "selected" : ""}>想玩</option><option value="playing" ${gameStatusFilter === "playing" ? "selected" : ""}>在玩</option><option value="completed" ${gameStatusFilter === "completed" ? "selected" : ""}>已通关</option><option value="paused" ${gameStatusFilter === "paused" ? "selected" : ""}>暂放</option></select></label></div>
     <div class="game-grid" id="game-results"></div></section>`;
@@ -337,7 +551,13 @@ document.addEventListener("click", (event) => {
   const button = event.target.closest("[data-action]");
   if (!button) return;
   const { action, id: recordId = "", projectId = "" } = button.dataset;
-  if (action === "create-project") openForm("project");
+  if (action === "auth-switch") renderAuth(button.dataset.mode);
+  else if (action === "import-data") document.querySelector("#data-import-file").click();
+  else if (action === "export-data") exportWorkspace();
+  else if (action === "sign-out") void supabaseClient.auth.signOut().then(({ error }) => {
+    if (error) showToast(`退出登录失败：${error.message}`);
+  });
+  else if (action === "create-project") openForm("project");
   else if (action === "edit-project") openForm("project", recordId);
   else if (action === "create-task") {
     const parts = location.hash.replace(/^#\/?/, "").split("/");
@@ -354,7 +574,9 @@ document.addEventListener("click", (event) => {
 
 document.addEventListener("change", (event) => {
   const target = event.target;
-  if (target.matches('[data-action="toggle-task"]')) {
+  if (target.id === "data-import-file") {
+    void importWorkspaceFile(target.files?.[0]).finally(() => { target.value = ""; });
+  } else if (target.matches('[data-action="toggle-task"]')) {
     const task = data.tasks.find((item) => item.id === target.dataset.id);
     if (task) {
       task.done = target.checked;
@@ -383,5 +605,8 @@ window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && dialog.open) dialog.close();
 });
 
-if (!storageAvailable) showToast("读取本机数据失败；为避免覆盖，当前不会写入新数据。");
-render();
+document.addEventListener("submit", (event) => {
+  if (event.target.id === "auth-form") void handleAuthSubmit(event);
+});
+
+void startApp();

@@ -7,10 +7,13 @@
   <meta name="description" content="个人工作台：管理工作项目、任务和游戏资料。">
   <title>我的工作台</title>
   <link rel="stylesheet" href="styles.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script defer src="supabase-config.js"></script>
   <script defer src="app.js"></script>
 </head>
 <body>
-  <div class="app-shell">
+  <main class="auth-screen" id="auth-root" hidden></main>
+  <div class="app-shell" id="workspace-shell" hidden>
     <aside class="sidebar">
       <a class="brand" href="#/home" aria-label="我的工作台，首页">
         <span class="brand-mark" aria-hidden="true">
@@ -57,19 +60,20 @@
           <strong>专注当下，稳步向前</strong>
           <p>把想法变成行动，让每一步都有迹可循。</p>
         </div>
-        <div class="profile-row"><span class="profile-avatar">我</span><span><strong>我的工作空间</strong><small>本机数据</small></span></div>
+        <div class="profile-row"><span class="profile-avatar">云</span><span><strong id="profile-email">我的工作空间</strong><small>云端同步</small></span></div>
       </div>
     </aside>
 
     <div class="main-shell">
       <header class="topbar">
         <div class="breadcrumbs"><span>工作空间</span><span class="crumb-separator">/</span><strong id="breadcrumb-title">总览</strong></div>
-        <div class="topbar-right"><span class="save-indicator"><i aria-hidden="true"></i><span id="save-label">本机保存</span></span><span class="top-avatar" aria-label="个人空间">我</span></div>
+        <div class="topbar-right"><span class="save-indicator"><i id="save-dot" aria-hidden="true"></i><span id="save-label">连接云端…</span></span><div class="topbar-actions"><button class="button small" type="button" data-action="import-data">导入 JSON</button><button class="button small" type="button" data-action="export-data">导出备份</button><button class="button small danger" type="button" data-action="sign-out">退出登录</button></div><span class="top-avatar" aria-label="个人空间">我</span></div>
       </header>
       <main class="page-content" id="app" tabindex="-1"></main>
     </div>
   </div>
 
+  <input id="data-import-file" type="file" accept=".json,application/json" hidden>
   <dialog class="entry-dialog" id="entry-dialog" aria-labelledby="dialog-title"></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </body>
