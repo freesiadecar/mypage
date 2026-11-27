@@ -143,7 +143,7 @@ function renderAuth(mode = "sign-in", message = "", isError = false) {
 
 async function handleAuthSubmit(event) {
   event.preventDefault();
-  const form = event.currentTarget;
+  const form = event.target;
   const values = new FormData(form);
   const email = String(values.get("email") ?? "").trim();
   const password = String(values.get("password") ?? "");
