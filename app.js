@@ -223,6 +223,7 @@ async function handleSession(session) {
   authRoot.hidden = true;
   workspaceShell.hidden = false;
   setSaveStatus("云端已同步");
+  history.replaceState(null, "", `${location.pathname}${location.search}#/home`);
   render();
   if (!row) await saveData(migrateLegacy ? "旧数据已迁移到云端" : "云端空间已创建");
 }
